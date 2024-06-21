@@ -1,7 +1,7 @@
 """
 Maigret main module
 """
-import aiohttp
+import ast
 import asyncio
 import logging
 import os
@@ -9,9 +9,9 @@ import sys
 import platform
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
 from typing import List, Tuple
+import os.path as path
 
-import requests
-from socid_extractor import extract, parse, __version__ as socid_version
+from socid_extractor import extract, parse
 
 from .__version__ import __version__
 from .checking import (
@@ -49,7 +49,7 @@ def notify_about_errors(search_results: QueryResultWrapper, query_notify):
     for e in errs:
         if not errors.is_important(e):
             continue
-        text = f'Too many errors of type "{e["err"]}" ({e["perc"]}%)'
+        text = f'Too many errors of type "{e["err"]}" ({round(e["perc"],2)}%)'
         solution = errors.solution_of(e['err'])
         if solution:
             text = '. '.join([text, solution.capitalize()])
@@ -86,8 +86,17 @@ def extract_ids_from_page(url, logger, timeout=5) -> dict:
         else:
             print(get_dict_ascii_tree(info.items(), new_line=False), ' ')
         for k, v in info.items():
-            if 'username' in k:
+            # TODO: merge with the same functionality in checking module
+            if 'username' in k and not 'usernames' in k:
                 results[v] = 'username'
+            elif 'usernames' in k:
+                try:
+                    tree = ast.literal_eval(v)
+                    if type(tree) == list:
+                        for n in tree:
+                         results[n] = 'username'
+                except Exception as e:
+                    logger.warning(e)
             if k in SUPPORTED_IDS:
                 results[v] = k
 
@@ -113,20 +122,26 @@ def extract_ids_from_results(results: QueryResultWrapper, db: MaigretDatabase) -
     return ids_results
 
 
-def setup_arguments_parser():
+def setup_arguments_parser(settings: Settings):
+    from aiohttp import __version__ as aiohttp_version
+    from requests import __version__ as requests_version
+    from socid_extractor import __version__ as socid_version
+
     version_string = '\n'.join(
         [
             f'%(prog)s {__version__}',
             f'Socid-extractor:  {socid_version}',
-            f'Aiohttp:  {aiohttp.__version__}',
-            f'Requests:  {requests.__version__}',
+            f'Aiohttp:  {aiohttp_version}',
+            f'Requests:  {requests_version}',
             f'Python:  {platform.python_version()}',
         ]
     )
 
     parser = ArgumentParser(
         formatter_class=RawDescriptionHelpFormatter,
-        description=f"Maigret v{__version__}",
+        description=f"Maigret v{__version__}\n"
+        "Documentation: https://maigret.readthedocs.io/\n"
+        "All settings are also configurable through files, see docs.",
     )
     parser.add_argument(
         "username",
@@ -146,9 +161,9 @@ def setup_arguments_parser():
         metavar='TIMEOUT',
         dest="timeout",
         type=timeout_check,
-        default=30,
-        help="Time in seconds to wait for response to requests. "
-        "Default timeout of 30.0s. "
+        default=settings.timeout,
+        help="Time in seconds to wait for response to requests "
+        f"(default {settings.timeout}s). "
         "A longer timeout will be more likely to get results from slow sites. "
         "On the other hand, this may cause a long delay to gather all results. ",
     )
@@ -157,7 +172,7 @@ def setup_arguments_parser():
         action="store",
         type=int,
         metavar='RETRIES',
-        default=1,
+        default=settings.retries_count,
         help="Attempts to restart temporarily failed requests.",
     )
     parser.add_argument(
@@ -166,21 +181,21 @@ def setup_arguments_parser():
         action="store",
         type=int,
         dest="connections",
-        default=100,
-        help="Allowed number of concurrent connections.",
+        default=settings.max_connections,
+        help=f"Allowed number of concurrent connections (default {settings.max_connections}).",
     )
     parser.add_argument(
         "--no-recursion",
         action="store_true",
         dest="disable_recursive_search",
-        default=False,
+        default=(not settings.recursive_search),
         help="Disable recursive search by additional data extracted from pages.",
     )
     parser.add_argument(
         "--no-extracting",
         action="store_true",
         dest="disable_extracting",
-        default=False,
+        default=(not settings.info_extracting),
         help="Disable parsing pages for additional data and other usernames.",
     )
     parser.add_argument(
@@ -194,14 +209,14 @@ def setup_arguments_parser():
         "--db",
         metavar="DB_FILE",
         dest="db_file",
-        default=None,
-        help="Load Maigret database from a JSON file or an online, valid, JSON file.",
+        default=settings.sites_db_path,
+        help="Load Maigret database from a JSON file or HTTP web resource.",
     )
     parser.add_argument(
         "--cookies-jar-file",
         metavar="COOKIE_FILE",
         dest="cookie_file",
-        default=None,
+        default=settings.cookie_jar_file,
         help="File with cookies.",
     )
     parser.add_argument(
@@ -209,7 +224,7 @@ def setup_arguments_parser():
         action="append",
         metavar='IGNORED_IDS',
         dest="ignore_ids_list",
-        default=[],
+        default=settings.ignore_ids_list,
         help="Do not make search by the specified username or other ids.",
     )
     # reports options
@@ -217,7 +232,7 @@ def setup_arguments_parser():
         "--folderoutput",
         "-fo",
         dest="folderoutput",
-        default="reports",
+        default=settings.reports_path,
         metavar="PATH",
         help="If using multiple usernames, the output of the results will be saved to this folder.",
     )
@@ -227,27 +242,27 @@ def setup_arguments_parser():
         metavar='PROXY_URL',
         action="store",
         dest="proxy",
-        default=None,
+        default=settings.proxy_url,
         help="Make requests over a proxy. e.g. socks5://127.0.0.1:1080",
     )
     parser.add_argument(
         "--tor-proxy",
         metavar='TOR_PROXY_URL',
         action="store",
-        default='socks5://127.0.0.1:9050',
+        default=settings.tor_proxy_url,
         help="Specify URL of your Tor gateway. Default is socks5://127.0.0.1:9050",
     )
     parser.add_argument(
         "--i2p-proxy",
         metavar='I2P_PROXY_URL',
         action="store",
-        default='http://127.0.0.1:4444',
+        default=settings.i2p_proxy_url,
         help="Specify URL of your I2P gateway. Default is http://127.0.0.1:4444",
     )
     parser.add_argument(
         "--with-domains",
         action="store_true",
-        default=False,
+        default=settings.domain_search,
         help="Enable (experimental) feature of checking domains on usernames.",
     )
 
@@ -259,13 +274,13 @@ def setup_arguments_parser():
         "--all-sites",
         action="store_true",
         dest="all_sites",
-        default=False,
+        default=settings.scan_all_sites,
         help="Use all sites for scan.",
     )
     filter_group.add_argument(
         "--top-sites",
         action="store",
-        default=500,
+        default=settings.top_sites_count,
         metavar="N",
         type=int,
         help="Count of sites for scan ranked by Alexa Top (default: 500).",
@@ -278,13 +293,13 @@ def setup_arguments_parser():
         action="append",
         metavar='SITE_NAME',
         dest="site_list",
-        default=[],
+        default=settings.scan_sites_list,
         help="Limit analysis to just the specified sites (multiple option).",
     )
     filter_group.add_argument(
         "--use-disabled-sites",
         action="store_true",
-        default=False,
+        default=settings.scan_disabled_sites,
         help="Use disabled sites to search (may cause many false positives).",
     )
 
@@ -311,7 +326,7 @@ def setup_arguments_parser():
     modes_group.add_argument(
         "--self-check",
         action="store_true",
-        default=False,
+        default=settings.self_check_enabled,
         help="Do self check for sites and database and disable non-working ones.",
     )
     modes_group.add_argument(
@@ -328,14 +343,14 @@ def setup_arguments_parser():
         "--print-not-found",
         action="store_true",
         dest="print_not_found",
-        default=False,
+        default=settings.print_not_found,
         help="Print sites where the username was not found.",
     )
     output_group.add_argument(
         "--print-errors",
         action="store_true",
         dest="print_check_errors",
-        default=False,
+        default=settings.print_check_errors,
         help="Print errors messages: connection, captcha, site country ban, etc.",
     )
     output_group.add_argument(
@@ -367,14 +382,14 @@ def setup_arguments_parser():
         "--no-color",
         action="store_true",
         dest="no_color",
-        default=False,
+        default=(not settings.colored_print),
         help="Don't color terminal output",
     )
     output_group.add_argument(
         "--no-progressbar",
         action="store_true",
         dest="no_progressbar",
-        default=False,
+        default=(not settings.show_progressbar),
         help="Don't show progressbar.",
     )
 
@@ -386,7 +401,7 @@ def setup_arguments_parser():
         "--txt",
         action="store_true",
         dest="txt",
-        default=False,
+        default=settings.txt_report,
         help="Create a TXT report (one report per username).",
     )
     report_group.add_argument(
@@ -394,7 +409,7 @@ def setup_arguments_parser():
         "--csv",
         action="store_true",
         dest="csv",
-        default=False,
+        default=settings.csv_report,
         help="Create a CSV report (one report per username).",
     )
     report_group.add_argument(
@@ -402,7 +417,7 @@ def setup_arguments_parser():
         "--html",
         action="store_true",
         dest="html",
-        default=False,
+        default=settings.html_report,
         help="Create an HTML report file (general report on all usernames).",
     )
     report_group.add_argument(
@@ -410,7 +425,7 @@ def setup_arguments_parser():
         "--xmind",
         action="store_true",
         dest="xmind",
-        default=False,
+        default=settings.xmind_report,
         help="Generate an XMind 8 mindmap report (one report per username).",
     )
     report_group.add_argument(
@@ -418,7 +433,7 @@ def setup_arguments_parser():
         "--pdf",
         action="store_true",
         dest="pdf",
-        default=False,
+        default=settings.pdf_report,
         help="Generate a PDF report (general report on all usernames).",
     )
     report_group.add_argument(
@@ -426,7 +441,7 @@ def setup_arguments_parser():
         "--graph",
         action="store_true",
         dest="graph",
-        default=False,
+        default=settings.graph_report,
         help="Generate a graph report (general report on all usernames).",
     )
     report_group.add_argument(
@@ -435,7 +450,7 @@ def setup_arguments_parser():
         action="store",
         metavar='TYPE',
         dest="json",
-        default='',
+        default=settings.json_report_type,
         choices=SUPPORTED_JSON_REPORT_FORMATS,
         help=f"Generate a JSON report of specific type: {', '.join(SUPPORTED_JSON_REPORT_FORMATS)}"
         " (one report per username).",
@@ -443,7 +458,7 @@ def setup_arguments_parser():
 
     parser.add_argument(
         "--reports-sorting",
-        default='default',
+        default=settings.report_sorting,
         choices=('default', 'data'),
         help="Method of results sorting in reports (default: in order of getting the result)",
     )
@@ -451,9 +466,6 @@ def setup_arguments_parser():
 
 
 async def main():
-    arg_parser = setup_arguments_parser()
-    args = arg_parser.parse_args()
-
     # Logging
     log_level = logging.ERROR
     logging.basicConfig(
@@ -461,15 +473,27 @@ async def main():
         datefmt='%H:%M:%S',
         level=log_level,
     )
+    logger = logging.getLogger('maigret')
+    logger.setLevel(log_level)
 
+    # Load settings
+    settings = Settings()
+    settings_loaded, err = settings.load()
+
+    if not settings_loaded:
+        logger.error(err)
+        sys.exit(3)
+
+    arg_parser = setup_arguments_parser(settings)
+    args = arg_parser.parse_args()
+
+    # Re-set logging level based on args
     if args.debug:
         log_level = logging.DEBUG
     elif args.info:
         log_level = logging.INFO
     elif args.verbose:
         log_level = logging.WARNING
-
-    logger = logging.getLogger('maigret')
     logger.setLevel(log_level)
 
     # Usernames initial list
@@ -495,16 +519,7 @@ async def main():
     if args.tags:
         args.tags = list(set(str(args.tags).split(',')))
 
-    settings = Settings(
-        os.path.join(
-            os.path.dirname(os.path.realpath(__file__)), "resources/settings.json"
-        )
-    )
-
-    if args.db_file is None:
-        args.db_file = os.path.join(
-            os.path.dirname(os.path.realpath(__file__)), "resources/data.json"
-        )
+    db_file = path.join(path.dirname(path.realpath(__file__)), args.db_file)
 
     if args.top_sites == 0 or args.all_sites:
         args.top_sites = sys.maxsize
@@ -519,7 +534,7 @@ async def main():
     )
 
     # Create object with all information about sites we are aware of.
-    db = MaigretDatabase().load_from_file(args.db_file)
+    db = MaigretDatabase().load_from_path(db_file)
     get_top_sites_for_id = lambda x: db.ranked_sites_dict(
         top=args.top_sites,
         tags=args.tags,
@@ -531,10 +546,10 @@ async def main():
     site_data = get_top_sites_for_id(args.id_type)
 
     if args.new_site_to_submit:
-        submitter = Submitter(db=db, logger=logger, settings=settings)
+        submitter = Submitter(db=db, logger=logger, settings=settings, args=args)
         is_submitted = await submitter.dialog(args.new_site_to_submit, args.cookie_file)
         if is_submitted:
-            db.save_to_file(args.db_file)
+            db.save_to_file(db_file)
 
     # Database self-checking
     if args.self_check:
@@ -543,6 +558,7 @@ async def main():
             db,
             site_data,
             logger,
+            proxy=args.proxy,
             max_connections=args.connections,
             tor_proxy=args.tor_proxy,
             i2p_proxy=args.i2p_proxy,
@@ -552,7 +568,7 @@ async def main():
                 'y',
                 '',
             ):
-                db.save_to_file(args.db_file)
+                db.save_to_file(db_file)
                 print('Database was successfully updated.')
             else:
                 print('Updates will be applied only for current search session.')
@@ -560,13 +576,15 @@ async def main():
 
     # Database statistics
     if args.stats:
-        print(db.get_db_stats(db.sites_dict))
+        print(db.get_db_stats())
+
+    report_dir = path.join(os.getcwd(), args.folderoutput)
 
     # Make reports folder is not exists
-    os.makedirs(args.folderoutput, exist_ok=True)
+    os.makedirs(report_dir, exist_ok=True)
 
     # Define one report filename template
-    report_filepath_tpl = os.path.join(args.folderoutput, 'report_{username}{postfix}')
+    report_filepath_tpl = path.join(report_dir, 'report_{username}{postfix}')
 
     if usernames == {}:
         # magic params to exit after init
@@ -682,7 +700,9 @@ async def main():
         username = report_context['username']
 
         if args.html:
-            filename = report_filepath_tpl.format(username=username, postfix='.html')
+            filename = report_filepath_tpl.format(
+                username=username, postfix='_plain.html'
+            )
             save_html_report(filename, report_context)
             query_notify.warning(f'HTML report on all usernames saved in {filename}')
 
@@ -692,7 +712,9 @@ async def main():
             query_notify.warning(f'PDF report on all usernames saved in {filename}')
 
         if args.graph:
-            filename = report_filepath_tpl.format(username=username, postfix='.html')
+            filename = report_filepath_tpl.format(
+                username=username, postfix='_graph.html'
+            )
             save_graph_report(filename, general_results, db)
             query_notify.warning(f'Graph report on all usernames saved in {filename}')
 
@@ -702,13 +724,16 @@ async def main():
             print(text_report)
 
     # update database
-    db.save_to_file(args.db_file)
+    db.save_to_file(db_file)
 
 
 def run():
     try:
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(main())
+        if sys.version_info.minor >= 10:
+            asyncio.run(main())
+        else:
+            loop = asyncio.get_event_loop()
+            loop.run_until_complete(main())
     except KeyboardInterrupt:
         print('Maigret is interrupted.')
         sys.exit(1)

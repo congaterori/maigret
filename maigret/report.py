@@ -7,13 +7,9 @@ import os
 from datetime import datetime
 from typing import Dict, Any
 
-import pycountry
 import xmind
 from dateutil.parser import parse as parse_datetime_str
 from jinja2 import Template
-from xhtml2pdf import pisa
-from pyvis.network import Network
-import networkx as nx
 
 from .checking import SUPPORTED_IDS
 from .result import QueryStatus
@@ -71,13 +67,17 @@ def save_txt_report(filename: str, username: str, results: dict):
 def save_html_report(filename: str, context: dict):
     template, _ = generate_report_template(is_pdf=False)
     filled_template = template.render(**context)
-    with open(filename, "w") as f:
+    with open(filename, "w", encoding="utf-8") as f:
         f.write(filled_template)
 
 
 def save_pdf_report(filename: str, context: dict):
     template, css = generate_report_template(is_pdf=True)
     filled_template = template.render(**context)
+
+    # moved here to speed up the launch of Maigret
+    from xhtml2pdf import pisa
+
     with open(filename, "w+b") as f:
         pisa.pisaDocument(io.StringIO(filled_template), dest=f, default_css=css)
 
@@ -117,6 +117,9 @@ class MaigretGraph:
 
 
 def save_graph_report(filename: str, username_results: list, db: MaigretDatabase):
+    # moved here to speed up the launch of Maigret
+    import networkx as nx
+
     G = nx.Graph()
     graph = MaigretGraph(G)
 
@@ -139,7 +142,9 @@ def save_graph_report(filename: str, username_results: list, db: MaigretDatabase
             if dictionary["status"].status != QueryStatus.CLAIMED:
                 continue
 
-            site_fallback_name = dictionary.get('url_user', f'{website_name}: {username.lower()}')
+            site_fallback_name = dictionary.get(
+                'url_user', f'{website_name}: {username.lower()}'
+            )
             # site_node_name = dictionary.get('url_user', f'{website_name}: {username.lower()}')
             site_node_name = graph.add_node('site', site_fallback_name)
             graph.link(username_node_name, site_node_name)
@@ -165,11 +170,13 @@ def save_graph_report(filename: str, username_results: list, db: MaigretDatabase
                             data_node_name = graph.add_node(vv, site_fallback_name)
                             graph.link(list_node_name, data_node_name)
 
-                            add_ids = {a: b for b, a in db.extract_ids_from_url(vv).items()}
+                            add_ids = {
+                                a: b for b, a in db.extract_ids_from_url(vv).items()
+                            }
                             if add_ids:
                                 process_ids(data_node_name, add_ids)
                     else:
-                    # value is just a string
+                        # value is just a string
                         # ids_data_name = f'{k}: {v}'
                         # if ids_data_name == parent_node:
                         #     continue
@@ -196,6 +203,9 @@ def save_graph_report(filename: str, username_results: list, db: MaigretDatabase
             nodes_to_remove.append(node)
 
     [G.remove_node(node) for node in nodes_to_remove]
+
+    # moved here to speed up the launch of Maigret
+    from pyvis.network import Network
 
     nt = Network(notebook=True, height="750px", width="100%")
     nt.from_nx(G)
@@ -249,6 +259,9 @@ def generate_report_context(username_results: list):
     supposed_data: Dict[str, Any] = {}
 
     first_seen = None
+
+    # moved here to speed up the launch of Maigret
+    import pycountry
 
     for username, id_type, results in username_results:
         found_accounts = 0

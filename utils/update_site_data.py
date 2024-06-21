@@ -3,13 +3,12 @@
 This module generates the listing of supported sites in file `SITES.md`
 and pretty prints file with sites data.
 """
-import json
 import sys
 import requests
 import logging
 import threading
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timezone
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
 
 from maigret.maigret import MaigretDatabase
@@ -25,11 +24,12 @@ RANKS.update({
     '100000000': '100M',
 })
 
-SEMAPHORE = threading.Semaphore(10)
+SEMAPHORE = threading.Semaphore(20)
+
 
 def get_rank(domain_to_query, site, print_errors=True):
     with SEMAPHORE:
-        #Retrieve ranking data via alexa API
+        # Retrieve ranking data via alexa API
         url = f"http://data.alexa.com/data?cli=10&url={domain_to_query}"
         xml_data = requests.get(url).text
         root = ET.fromstring(xml_data)
@@ -114,7 +114,7 @@ Rank data fetched from Alexa by domains.
                 sys.stdout.flush()
                 index = index + 1
 
-        sites_full_list = [(s, s.alexa_rank) for s in sites_subset]
+        sites_full_list = [(s, int(s.alexa_rank)) for s in sites_subset]
 
         sites_full_list.sort(reverse=False, key=lambda x: x[1])
 
@@ -137,7 +137,11 @@ Rank data fetched from Alexa by domains.
             site_file.write(f'1. {favicon} [{site}]({url_main})*: top {valid_rank}{tags}*{note}\n')
             db.update_site(site)
 
-        site_file.write(f'\nAlexa.com rank data fetched at ({datetime.utcnow()} UTC)\n')
+        site_file.write(f'\nThe list was updated at ({datetime.now(timezone.utc)} UTC)\n')
         db.save_to_file(args.base_file)
+
+        statistics_text = db.get_db_stats(is_markdown=True)
+        site_file.write('## Statistics\n\n')
+        site_file.write(statistics_text)
 
     print("\nFinished updating supported site listing!")

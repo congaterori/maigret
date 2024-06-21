@@ -6,19 +6,20 @@ try:
 except ImportError:
     from unittest.mock import Mock
 
+import ast
 import re
 import ssl
 import sys
 import tqdm
+import random
 from typing import Tuple, Optional, Dict, List
 from urllib.parse import quote
 
-import aiohttp
 import aiodns
 import tqdm.asyncio
-from aiohttp_socks import ProxyConnector
 from python_socks import _errors as proxy_errors
 from socid_extractor import extract
+from aiohttp import TCPConnector, ClientSession, http_exceptions
 from aiohttp.client_exceptions import ServerDisconnectedError, ClientConnectorError
 
 from .activation import ParsingActivator, import_aiohttp_cookies
@@ -29,6 +30,7 @@ from .executors import (
     AsyncioSimpleExecutor,
     AsyncioProgressbarQueueExecutor,
 )
+
 from .result import QueryResult, QueryStatus
 from .sites import MaigretDatabase, MaigretSite
 from .types import QueryOptions, QueryResultWrapper
@@ -60,12 +62,13 @@ class SimpleAiohttpChecker(CheckerBase):
         cookie_jar = kwargs.get('cookie_jar')
         self.logger = kwargs.get('logger', Mock())
 
+        # moved here to speed up the launch of Maigret
+        from aiohttp_socks import ProxyConnector
+
         # make http client session
-        connector = (
-            ProxyConnector.from_url(proxy) if proxy else aiohttp.TCPConnector(ssl=False)
-        )
+        connector = ProxyConnector.from_url(proxy) if proxy else TCPConnector(ssl=False)
         connector.verify_ssl = False
-        self.session = aiohttp.ClientSession(
+        self.session = ClientSession(
             connector=connector, trust_env=True, cookie_jar=cookie_jar
         )
 
@@ -113,7 +116,7 @@ class SimpleAiohttpChecker(CheckerBase):
             error = CheckError("Connecting failure", str(e))
         except ServerDisconnectedError as e:
             error = CheckError("Server disconnected", str(e))
-        except aiohttp.http_exceptions.BadHttpMessage as e:
+        except http_exceptions.BadHttpMessage as e:
             error = CheckError("HTTP", str(e))
         except proxy_errors.ProxyError as e:
             error = CheckError("Proxy", str(e))
@@ -130,6 +133,9 @@ class SimpleAiohttpChecker(CheckerBase):
                 self.logger.debug(e, exc_info=True)
                 error = CheckError("Unexpected", str(e))
 
+        if error == "Invalid proxy response":
+            self.logger.debug(error, exc_info=True)
+
         return str(html_text), status_code, error
 
 
@@ -139,14 +145,20 @@ class ProxiedAiohttpChecker(SimpleAiohttpChecker):
         cookie_jar = kwargs.get('cookie_jar')
         self.logger = kwargs.get('logger', Mock())
 
+        # moved here to speed up the launch of Maigret
+        from aiohttp_socks import ProxyConnector
+
         connector = ProxyConnector.from_url(proxy)
         connector.verify_ssl = False
-        self.session = aiohttp.ClientSession(
+        self.session = ClientSession(
             connector=connector, trust_env=True, cookie_jar=cookie_jar
         )
 
 
 class AiodnsDomainResolver(CheckerBase):
+    if sys.platform == 'win32':  # Temporary workaround for Windows
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
     def __init__(self, *args, **kwargs):
         loop = asyncio.get_event_loop()
         self.logger = kwargs.get('logger', Mock())
@@ -366,8 +378,16 @@ def process_site_result(
         if extracted_ids_data:
             new_usernames = {}
             for k, v in extracted_ids_data.items():
-                if "username" in k:
+                if "username" in k and not "usernames" in k:
                     new_usernames[v] = "username"
+                elif "usernames" in k:
+                    try:
+                        tree = ast.literal_eval(v)
+                        if type(tree) == list:
+                            for n in tree:
+                             new_usernames[n] = "username"
+                    except Exception as e:
+                        logger.warning(e)
                 if k in SUPPORTED_IDS:
                     new_usernames[v] = k
 
@@ -390,7 +410,7 @@ def process_site_result(
 
 
 def make_site_result(
-    site: MaigretSite, username: str, options: QueryOptions, logger
+    site: MaigretSite, username: str, options: QueryOptions, logger, *args, **kwargs
 ) -> QueryResultWrapper:
     results_site: QueryResultWrapper = {}
 
@@ -413,6 +433,10 @@ def make_site_result(
 
     if "url" not in site.__dict__:
         logger.error("No URL for site %s", site.name)
+
+    if kwargs.get('retry') and hasattr(site, "mirrors"):
+        site.url_main = random.choice(site.mirrors)
+        logger.info(f"Use {site.url_main} as a main url of site {site}")
 
     # URL of user on site (if it exists)
     url = site.url.format(
@@ -517,7 +541,9 @@ def make_site_result(
 async def check_site_for_username(
     site, username, options: QueryOptions, logger, query_notify, *args, **kwargs
 ) -> Tuple[str, QueryResultWrapper]:
-    default_result = make_site_result(site, username, options, logger)
+    default_result = make_site_result(
+        site, username, options, logger, retry=kwargs.get('retry')
+    )
     future = default_result.get("future")
     if not future:
         return site.name, default_result
@@ -573,6 +599,8 @@ async def maigret(
     cookies=None,
     retries=0,
     check_domains=False,
+    *args,
+    **kwargs,
 ) -> QueryResultWrapper:
     """Main search func
 
@@ -590,7 +618,7 @@ async def maigret(
     is_parsing_enabled     -- Extract additional info from account pages.
     id_type                -- Type of username to search.
                               Default is 'username', see all supported here:
-                              https://github.com/soxoj/maigret/wiki/Supported-identifier-types
+                              https://maigret.readthedocs.io/en/latest/supported-identifier-types.html
     max_connections        -- Maximum number of concurrent connections allowed.
                               Default is 100.
     no_progressbar         -- Displaying of ASCII progressbar during scanner.
@@ -653,7 +681,11 @@ async def maigret(
         executor = AsyncioSimpleExecutor(logger=logger)
     else:
         executor = AsyncioProgressbarQueueExecutor(
-            logger=logger, in_parallel=max_connections, timeout=timeout + 0.5
+            logger=logger,
+            in_parallel=max_connections,
+            timeout=timeout + 0.5,
+            *args,
+            **kwargs,
         )
 
     # make options objects for all the requests
@@ -695,7 +727,10 @@ async def maigret(
             tasks_dict[sitename] = (
                 check_site_for_username,
                 [site, username, options, logger, query_notify],
-                {'default': (sitename, default_result)},
+                {
+                    'default': (sitename, default_result),
+                    'retry': retries - attempts + 1,
+                },
             )
 
         cur_results = await executor.run(tasks_dict.values())
@@ -760,6 +795,7 @@ async def site_self_check(
     semaphore,
     db: MaigretDatabase,
     silent=False,
+    proxy=None,
     tor_proxy=None,
     i2p_proxy=None,
 ):
@@ -785,6 +821,7 @@ async def site_self_check(
                 forced=True,
                 no_progressbar=True,
                 retries=1,
+                proxy=proxy,
                 tor_proxy=tor_proxy,
                 i2p_proxy=i2p_proxy,
             )
@@ -841,6 +878,7 @@ async def self_check(
     logger,
     silent=False,
     max_connections=10,
+    proxy=None,
     tor_proxy=None,
     i2p_proxy=None,
 ) -> bool:
@@ -855,7 +893,7 @@ async def self_check(
 
     for _, site in all_sites.items():
         check_coro = site_self_check(
-            site, logger, sem, db, silent, tor_proxy, i2p_proxy
+            site, logger, sem, db, silent, proxy, tor_proxy, i2p_proxy
         )
         future = asyncio.ensure_future(check_coro)
         tasks.append(future)

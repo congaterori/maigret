@@ -1,8 +1,11 @@
 import asyncio
+import json
 import re
 from typing import List
-import xml.etree.ElementTree as ET
+from xml.etree import ElementTree
+from aiohttp import TCPConnector, ClientSession
 import requests
+import cloudscraper
 
 from .activation import import_aiohttp_cookies
 from .checking import maigret
@@ -10,6 +13,28 @@ from .result import QueryStatus
 from .settings import Settings
 from .sites import MaigretDatabase, MaigretSite, MaigretEngine
 from .utils import get_random_user_agent, get_match_ratio
+
+
+class CloudflareSession:
+    def __init__(self):
+        self.scraper = cloudscraper.create_scraper()
+
+    async def get(self, *args, **kwargs):
+        await asyncio.sleep(0)
+        res = self.scraper.get(*args, **kwargs)
+        self.last_text = res.text
+        self.status = res.status_code
+        return self
+
+    def status_code(self):
+        return self.status
+
+    async def text(self):
+        await asyncio.sleep(0)
+        return self.last_text
+
+    async def close(self):
+        pass
 
 
 class Submitter:
@@ -23,16 +48,30 @@ class Submitter:
     TOP_FEATURES = 5
     URL_RE = re.compile(r"https?://(www\.)?")
 
-    def __init__(self, db: MaigretDatabase, settings: Settings, logger):
+    def __init__(self, db: MaigretDatabase, settings: Settings, logger, args):
         self.settings = settings
+        self.args = args
         self.db = db
         self.logger = logger
+
+        from aiohttp_socks import ProxyConnector
+
+        proxy = self.args.proxy
+        cookie_jar = None
+        if args.cookie_file:
+            cookie_jar = import_aiohttp_cookies(args.cookie_file)
+
+        connector = ProxyConnector.from_url(proxy) if proxy else TCPConnector(ssl=False)
+        connector.verify_ssl = False
+        self.session = ClientSession(
+            connector=connector, trust_env=True, cookie_jar=cookie_jar
+        )
 
     @staticmethod
     def get_alexa_rank(site_url_main):
         url = f"http://data.alexa.com/data?cli=10&url={site_url_main}"
         xml_data = requests.get(url).text
-        root = ET.fromstring(xml_data)
+        root = ElementTree.fromstring(xml_data)
         alexa_rank = 0
 
         try:
@@ -62,7 +101,9 @@ class Submitter:
             results_dict = await maigret(
                 username=username,
                 site_dict={site.name: site},
+                proxy=self.args.proxy,
                 logger=self.logger,
+                cookies=self.args.cookie_file,
                 timeout=30,
                 id_type=site.type,
                 forced=True,
@@ -124,21 +165,27 @@ class Submitter:
                 fields['urlSubpath'] = f'/{subpath}'
         return fields
 
-    async def detect_known_engine(self, url_exists, url_mainpage) -> List[MaigretSite]:
+    async def detect_known_engine(
+        self, url_exists, url_mainpage
+    ) -> [List[MaigretSite], str]:
+        resp_text = ''
         try:
-            r = requests.get(url_mainpage)
-            self.logger.debug(r.text)
+            r = await self.session.get(url_mainpage)
+            content = await r.content.read()
+            charset = r.charset or "utf-8"
+            resp_text = content.decode(charset, "ignore")
+            self.logger.debug(resp_text)
         except Exception as e:
             self.logger.warning(e)
             print("Some error while checking main page")
-            return []
+            return [], resp_text
 
         for engine in self.db.engines:
             strs_to_check = engine.__dict__.get("presenseStrs")
-            if strs_to_check and r and r.text:
+            if strs_to_check and resp_text:
                 all_strs_in_response = True
                 for s in strs_to_check:
-                    if s not in r.text:
+                    if s not in resp_text:
                         all_strs_in_response = False
                 sites = []
                 if all_strs_in_response:
@@ -174,11 +221,12 @@ class Submitter:
                         )
                         sites.append(maigret_site)
 
-                    return sites
+                    return sites, resp_text
 
-        return []
+        return [], resp_text
 
-    def extract_username_dialog(self, url):
+    @staticmethod
+    def extract_username_dialog(url):
         url_parts = url.rstrip("/").split("/")
         supposed_username = url_parts[-1].strip('@')
         entered_username = input(
@@ -190,7 +238,7 @@ class Submitter:
         self, url_exists, url_mainpage, cookie_file, redirects=False
     ):
         custom_headers = {}
-        while True:
+        while self.args.verbose:
             header_key = input(
                 'Specify custom header if you need or just press Enter to skip. Header name: '
             )
@@ -208,32 +256,28 @@ class Submitter:
         headers = dict(self.HEADERS)
         headers.update(custom_headers)
 
-        # cookies
-        cookie_dict = None
-        if cookie_file:
-            self.logger.info(f'Use {cookie_file} for cookies')
-            cookie_jar = import_aiohttp_cookies(cookie_file)
-            cookie_dict = {c.key: c.value for c in cookie_jar}
-
-        exists_resp = requests.get(
-            url_exists, cookies=cookie_dict, headers=headers, allow_redirects=redirects
-        )
-        self.logger.debug(url_exists)
-        self.logger.debug(exists_resp.status_code)
-        self.logger.debug(exists_resp.text)
-
-        non_exists_resp = requests.get(
-            url_not_exists,
-            cookies=cookie_dict,
+        exists_resp = await self.session.get(
+            url_exists,
             headers=headers,
             allow_redirects=redirects,
         )
-        self.logger.debug(url_not_exists)
-        self.logger.debug(non_exists_resp.status_code)
-        self.logger.debug(non_exists_resp.text)
+        exists_resp_text = await exists_resp.text()
+        self.logger.debug(url_exists)
+        self.logger.debug(exists_resp.status)
+        self.logger.debug(exists_resp_text)
 
-        a = exists_resp.text
-        b = non_exists_resp.text
+        non_exists_resp = await self.session.get(
+            url_not_exists,
+            headers=headers,
+            allow_redirects=redirects,
+        )
+        non_exists_resp_text = await non_exists_resp.text()
+        self.logger.debug(url_not_exists)
+        self.logger.debug(non_exists_resp.status)
+        self.logger.debug(non_exists_resp_text)
+
+        a = exists_resp_text
+        b = non_exists_resp_text
 
         tokens_a = set(re.split(f'[{self.SEPARATORS}]', a))
         tokens_b = set(re.split(f'[{self.SEPARATORS}]', b))
@@ -322,16 +366,33 @@ class Submitter:
 
         print('Detecting site engine, please wait...')
         sites = []
+        text = None
         try:
-            sites = await self.detect_known_engine(url_exists, url_mainpage)
+            sites, text = await self.detect_known_engine(url_exists, url_exists)
         except KeyboardInterrupt:
             print('Engine detect process is interrupted.')
 
+        if 'cloudflare' in text.lower():
+            print(
+                'Cloudflare protection detected. I will use cloudscraper for futher work'
+            )
+            # self.session = CloudflareSession()
+
         if not sites:
             print("Unable to detect site engine, lets generate checking features")
+
+            redirects = False
+            if self.args.verbose:
+                redirects = (
+                    'y' in input('Should we do redirects automatically? [yN] ').lower()
+                )
+
             sites = [
                 await self.check_features_manually(
-                    url_exists, url_mainpage, cookie_file
+                    url_exists,
+                    url_mainpage,
+                    cookie_file,
+                    redirects,
                 )
             ]
 
@@ -356,6 +417,7 @@ class Submitter:
             print(
                 "Try to run this mode again and increase features count or choose others."
             )
+            self.logger.debug(json.dumps(chosen_site.json))
             return False
         else:
             if (
@@ -367,12 +429,17 @@ class Submitter:
             ):
                 return False
 
+        if self.args.verbose:
+            source = input("Name the source site if it is mirror: ")
+            if source:
+                chosen_site.source = source
+
         chosen_site.name = input("Change site name if you want: ") or chosen_site.name
         chosen_site.tags = list(map(str.strip, input("Site tags: ").split(',')))
-        rank = Submitter.get_alexa_rank(chosen_site.url_main)
-        if rank:
-            print(f'New alexa rank: {rank}')
-            chosen_site.alexa_rank = rank
+        # rank = Submitter.get_alexa_rank(chosen_site.url_main)
+        # if rank:
+        #     print(f'New alexa rank: {rank}')
+        #     chosen_site.alexa_rank = rank
 
         self.logger.debug(chosen_site.json)
         site_data = chosen_site.strip_engine_data()

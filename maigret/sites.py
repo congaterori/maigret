@@ -5,8 +5,6 @@ import json
 import sys
 from typing import Optional, List, Dict, Any, Tuple
 
-import requests
-
 from .utils import CaseConverter, URLMatcher, is_country_tag
 
 
@@ -292,6 +290,9 @@ class MaigretDatabase:
         return self
 
     def save_to_file(self, filename: str) -> "MaigretDatabase":
+        if '://' in filename:
+            return self
+
         db_data = {
             "sites": {site.name: site.strip_engine_data().json for site in self._sites},
             "engines": {engine.name: engine.json for engine in self._engines},
@@ -344,11 +345,19 @@ class MaigretDatabase:
 
         return self.load_from_json(data)
 
-    def load_from_url(self, url: str) -> "MaigretDatabase":
+    def load_from_path(self, path: str) -> "MaigretDatabase":
+        if '://' in path:
+            return self.load_from_http(path)
+        else:
+            return self.load_from_file(path)
+
+    def load_from_http(self, url: str) -> "MaigretDatabase":
         is_url_valid = url.startswith("http://") or url.startswith("https://")
 
         if not is_url_valid:
             raise FileNotFoundError(f"Invalid data file URL '{url}'.")
+
+        import requests
 
         try:
             response = requests.get(url=url)
@@ -400,7 +409,6 @@ class MaigretDatabase:
 
         return found_flags
 
-
     def extract_ids_from_url(self, url: str) -> dict:
         results = {}
         for s in self._sites:
@@ -411,16 +419,19 @@ class MaigretDatabase:
             results[_id] = _type
         return results
 
-
-    def get_db_stats(self, sites_dict):
-        if not sites_dict:
-            sites_dict = self.sites_dict()
+    def get_db_stats(self, is_markdown=False):
+        sites_dict = self.sites_dict
 
         urls = {}
         tags = {}
         output = ""
         disabled_count = 0
         total_count = len(sites_dict)
+
+        message_checks = 0
+        message_checks_one_factor = 0
+
+        status_checks = 0
 
         for _, site in sites_dict.items():
             if site.disabled:
@@ -429,24 +440,58 @@ class MaigretDatabase:
             url_type = site.get_url_template()
             urls[url_type] = urls.get(url_type, 0) + 1
 
+            if site.check_type == 'message' and not site.disabled:
+                message_checks += 1
+                if site.absence_strs and site.presense_strs:
+                    continue
+                message_checks_one_factor += 1
+
+            if site.check_type == 'status_code':
+                status_checks += 1
+
             if not site.tags:
                 tags["NO_TAGS"] = tags.get("NO_TAGS", 0) + 1
 
             for tag in filter(lambda x: not is_country_tag(x), site.tags):
                 tags[tag] = tags.get(tag, 0) + 1
 
-        output += f"Enabled/total sites: {total_count - disabled_count}/{total_count}\n"
-        output += "Top profile URLs:\n"
-        for url, count in sorted(urls.items(), key=lambda x: x[1], reverse=True)[:20]:
+        enabled_count = total_count - disabled_count
+        enabled_perc = round(100 * enabled_count / total_count, 2)
+        output += (
+            f"Enabled/total sites: {enabled_count}/{total_count} = {enabled_perc}%\n\n"
+        )
+
+        checks_perc = round(100 * message_checks_one_factor / enabled_count, 2)
+        output += f"Incomplete message checks: {message_checks_one_factor}/{enabled_count} = {checks_perc}% (false positive risks)\n\n"
+
+        status_checks_perc = round(100 * status_checks / enabled_count, 2)
+        output += f"Status code checks: {status_checks}/{enabled_count} = {status_checks_perc}% (false positive risks)\n\n"
+
+        output += (
+            f"False positive risk (total): {checks_perc+status_checks_perc:.2f}%\n\n"
+        )
+
+        top_urls_count = 20
+        output += f"Top {top_urls_count} profile URLs:\n"
+        for url, count in sorted(urls.items(), key=lambda x: x[1], reverse=True)[
+            :top_urls_count
+        ]:
             if count == 1:
                 break
-            output += f"{count}\t{url}\n"
+            output += f"- ({count})\t`{url}`\n" if is_markdown else f"{count}\t{url}\n"
 
-        output += "Top tags:\n"
-        for tag, count in sorted(tags.items(), key=lambda x: x[1], reverse=True)[:200]:
+        top_tags_count = 20
+        output += f"\nTop {top_tags_count} tags:\n"
+        for tag, count in sorted(tags.items(), key=lambda x: x[1], reverse=True)[
+            :top_tags_count
+        ]:
             mark = ""
             if tag not in self._tags:
                 mark = " (non-standard)"
-            output += f"{count}\t{tag}{mark}\n"
+            output += (
+                f"- ({count})\t`{tag}`{mark}\n"
+                if is_markdown
+                else f"{count}\t{tag}{mark}\n"
+            )
 
         return output

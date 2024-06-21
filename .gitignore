@@ -15,6 +15,10 @@ src/
 .ipynb_checkpoints
 *.ipynb
 
+# Logs and backups
+*.log
+*.bak
+
 # Output files, except requirements.txt
 *.txt
 !requirements.txt
@@ -31,3 +35,6 @@ src/
 dist/
 htmlcov/
 /test_*
+
+# Maigret files
+settings.json
